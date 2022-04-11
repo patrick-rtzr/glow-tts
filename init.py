@@ -11,7 +11,7 @@ from data_utils import TextMelLoader, TextMelCollate
 import models
 import commons
 import utils
-from text.symbols import symbols
+from text import VOCAB_DICT
                             
 
 class FlowGenerator_DDI(models.FlowGenerator):
@@ -30,15 +30,14 @@ def main():
   utils.check_git_hash(hps.model_dir)
 
   torch.manual_seed(hps.train.seed)
-
   train_dataset = TextMelLoader(hps.data.training_files, hps.data)
   collate_fn = TextMelCollate(1)
-  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=True,
+  train_loader = DataLoader(train_dataset, num_workers=0, shuffle=True,
       batch_size=hps.train.batch_size, pin_memory=True,
       drop_last=True, collate_fn=collate_fn)
 
   generator = FlowGenerator_DDI(
-      len(symbols) + getattr(hps.data, "add_blank", False), 
+      len(VOCAB_DICT.keys()) + getattr(hps.data, "add_blank", False), 
       out_channels=hps.data.n_mel_channels,
       **hps.model).cuda()
   optimizer_g = commons.Adam(generator.parameters(), scheduler=hps.train.scheduler, dim_model=hps.model.hidden_channels, warmup_steps=hps.train.warmup_steps, lr=hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps)

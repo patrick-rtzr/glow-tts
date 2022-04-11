@@ -9,14 +9,17 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from apex.parallel import DistributedDataParallel as DDP
-from apex import amp
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+import collections.abc as container_abcs
+#from apex.parallel import DistributedDataParallel as DDP
+#from apex import amp
 
 from data_utils import TextMelLoader, TextMelCollate
 import models
 import commons
 import utils
-from text.symbols import symbols
+from text import VOCAB_DICT
                             
 
 global_step = 0
@@ -27,12 +30,14 @@ def main():
   assert torch.cuda.is_available(), "CPU training is not allowed."
 
   n_gpus = torch.cuda.device_count()
-  os.environ['MASTER_ADDR'] = 'localhost'
-  os.environ['MASTER_PORT'] = '80000'
-
+    
+  torch.manual_seed(1234) 
   hps = utils.get_hparams()
-  mp.spawn(train_and_eval, nprocs=n_gpus, args=(n_gpus, hps,))
-
+  
+ # if n_gpus > 1:
+ #   mp.spawn(train_and_eval, nprocs=n_gpus, args=(n_gpus, hps,))
+ # else:
+  train_and_eval(0, n_gpus, hps)
 
 def train_and_eval(rank, n_gpus, hps):
   global global_step
@@ -43,18 +48,19 @@ def train_and_eval(rank, n_gpus, hps):
     writer = SummaryWriter(log_dir=hps.model_dir)
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+  #dist.init_process_group(backend='nccl', init_method="tcp://localhost:54321", world_size=n_gpus, rank=rank)
   torch.manual_seed(hps.train.seed)
-  torch.cuda.set_device(rank)
+  #torch.cuda.set_device(rank)
+  device = torch.device('cuda:{:d}'.format(rank))
 
   train_dataset = TextMelLoader(hps.data.training_files, hps.data)
-  train_sampler = torch.utils.data.distributed.DistributedSampler(
-      train_dataset,
-      num_replicas=n_gpus,
-      rank=rank,
-      shuffle=True)
+  train_sampler = None#torch.utils.data.distributed.DistributedSampler(
+    #  train_dataset,
+    #  num_replicas=n_gpus,
+    #  rank=rank,
+    #  shuffle=True)
   collate_fn = TextMelCollate(1)
-  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False,
+  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=True,
       batch_size=hps.train.batch_size, pin_memory=True,
       drop_last=True, collate_fn=collate_fn, sampler=train_sampler)
   if rank == 0:
@@ -64,13 +70,13 @@ def train_and_eval(rank, n_gpus, hps):
         drop_last=True, collate_fn=collate_fn)
 
   generator = models.FlowGenerator(
-      n_vocab=len(symbols) + getattr(hps.data, "add_blank", False), 
+      n_vocab=len(VOCAB_DICT.keys()) + getattr(hps.data, "add_blank", False), 
       out_channels=hps.data.n_mel_channels, 
-      **hps.model).cuda(rank)
+      **hps.model).to(device)
   optimizer_g = commons.Adam(generator.parameters(), scheduler=hps.train.scheduler, dim_model=hps.model.hidden_channels, warmup_steps=hps.train.warmup_steps, lr=hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps)
-  if hps.train.fp16_run:
-    generator, optimizer_g._optim = amp.initialize(generator, optimizer_g._optim, opt_level="O1")
-  generator = DDP(generator)
+  #if hps.train.fp16_run:
+  #  generator, optimizer_g._optim = amp.initialize(generator, optimizer_g._optim, opt_level="O1")
+  #generator = DDP(generator)
   epoch_str = 1
   global_step = 0
   try:
@@ -93,9 +99,9 @@ def train_and_eval(rank, n_gpus, hps):
 
 
 def train(rank, epoch, hps, generator, optimizer_g, train_loader, logger, writer):
-  train_loader.sampler.set_epoch(epoch)
+  #train_loader.sampler.set_epoch(epoch)
   global global_step
-
+  
   generator.train()
   for batch_idx, (x, x_lengths, y, y_lengths) in enumerate(train_loader):
     x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(rank, non_blocking=True)
@@ -122,7 +128,7 @@ def train(rank, epoch, hps, generator, optimizer_g, train_loader, logger, writer
     
     if rank==0:
       if batch_idx % hps.train.log_interval == 0:
-        (y_gen, *_), *_ = generator.module(x[:1], x_lengths[:1], gen=True)
+        (y_gen, *_), *_ = generator(x[:1], x_lengths[:1], gen=True)
         logger.info('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
           epoch, batch_idx * len(x), len(train_loader.dataset),
           100. * batch_idx / len(train_loader),
